@@ -1,13 +1,28 @@
 [project]
 name = "vibethon"
 version = "0.1.0"
-description = "Objects whose methods are written by a local LLM the moment you call them"
+description = "Objects whose methods are written by an LLM the moment you call them"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
+authors = [{ name = "bhivam", email = "shivamkajaria@gmail.com" }]
+keywords = ["llm", "codegen", "metaprogramming", "litellm", "openrouter"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+]
 dependencies = [
     "litellm>=1.88.1",
-    "python-dotenv>=1.2.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/bhivam/vibethon"
+Repository = "https://github.com/bhivam/vibethon"
 
 [build-system]
 requires = ["hatchling"]
