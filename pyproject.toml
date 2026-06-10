@@ -1,5 +1,5 @@
 [project]
-name = "vibethon"
+name = "vybthon"
 version = "0.1.0"
 description = "Objects whose methods are written by an LLM the moment you call them"
 readme = "README.md"
@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/bhivam/vibethon"
-Repository = "https://github.com/bhivam/vibethon"
+Homepage = "https://github.com/bhivam/vybthon"
+Repository = "https://github.com/bhivam/vybthon"
 
 [build-system]
 requires = ["hatchling"]
