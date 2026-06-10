@@ -1,5 +1,3 @@
-"""The ``Vibe`` object: undefined methods are synthesized by an LLM on call."""
-
 from __future__ import annotations
 
 import os
@@ -10,24 +8,13 @@ import litellm
 from litellm import CustomStreamWrapper, completion
 from litellm.types.utils import ModelResponseStream, StreamingChoices
 
-from .codegen import build_messages, materialize, strip_fences
+from .codegen import Spec, build_messages, materialize, strip_fences
 from .console import Console
 
-litellm.suppress_debug_info = True  # silence litellm's "Provider List" banner
-
-
+litellm.suppress_debug_info = True
 
 class Vibe:
-    """An object whose undefined methods are synthesized by an LLM on first call.
-
-    Call any method name; if it doesn't exist yet, the model writes a function
-    that does what the name + arguments imply, it's executed, and the source is
-    cached to disk for reuse on later calls and future runs.
-
-    SECURITY: synthesized code is executed with ``exec``. LLM output is
-    untrusted — treat every generated function as arbitrary code. This is a toy,
-    not a sandbox; run it only against a local model you trust.
-    """
+    """An object whose undefined methods are synthesized by an LLM on first call."""
 
     def __init__(
         self,
@@ -36,6 +23,7 @@ class Vibe:
         api_base: str | None ,
         api_key: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        packages: list[str] | None = None,
         cache_dir: Path | str | None = None,
         verbose: bool = False,
         retries: int = 2,
@@ -45,11 +33,15 @@ class Vibe:
         self._api_base = api_base
         self._api_key = api_key
         self._extra_body = extra_body
+        self._packages = packages
+
         self._cache_dir = Path(cache_dir) if cache_dir else Path.cwd() / ".vibe_cache"
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
         self._retries = retries
         self._console = Console(enabled=verbose)
         self._fns: dict[str, Callable[..., Any]] = {}
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._specs: dict[str, Spec] = {}
         self._caching = caching
 
     @classmethod
@@ -61,7 +53,7 @@ class Vibe:
         **kwargs: Any,
     ) -> "Vibe":
         OPENROUTER_BASE_URL = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
-        OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+        OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
         if reasoning:
             extra_body = {**kwargs.pop("extra_body", {}), "reasoning": {"enabled": True}}
@@ -69,6 +61,24 @@ class Vibe:
         return cls(model, api_base=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY, **kwargs)
 
     # -- public surface ----------------------------------------------------
+
+    def spec(
+        self,
+        name: str,
+        *,
+        context: str | None = None,
+        inputs: str | None = None,
+        returns: str | None = None,
+    ) -> "Vibe":
+        """Register first-call guidance for ``name``: free-form context and the
+        intended input/output shapes the synthesizer should match.
+
+        Consulted only when ``name`` is synthesized, so it has no effect once the
+        function is cached and is never part of the cache key. Returns ``self``
+        so specs can be chained before the first call.
+        """
+        self._specs[name] = Spec(context=context, inputs=inputs, returns=returns)
+        return self
 
     def __getattr__(self, name: str) -> Callable[..., Any]:
         # Never intercept dunder / private lookups (copy, repr, IPython probes,
@@ -165,7 +175,12 @@ class Vibe:
         version avoids whatever the previous one got wrong.
         """
         self._console.status(f"synthesizing {name}" + (" (retry)" if error else ""))
-        source = self._stream(build_messages(name, args, kwargs, error))
+        messages = build_messages(
+            name, args, kwargs, error,
+            packages=self._packages,
+            spec=self._specs.get(name),
+        )
+        source = self._stream(messages)
         self._console.status(f"synthesized {name}")
         return source
 
