@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -8,10 +9,25 @@ import litellm
 from litellm import CustomStreamWrapper, completion
 from litellm.types.utils import ModelResponseStream, StreamingChoices
 
-from .codegen import Spec, build_messages, materialize, strip_fences
+from .codegen import Dependency, Spec, build_messages, materialize, strip_fences
 from .console import Console
 
 litellm.suppress_debug_info = True
+
+# Dependency names recorded in a cache file's header, so a function loaded from
+# disk in a fresh process still gets its siblings injected even before any
+# spec() calls are re-registered.
+_USES_RE = re.compile(r"^# vibe-uses: (.+)$", re.MULTILINE)
+
+
+def _strip_header(text: str) -> str:
+    """Drop the leading ``# vibe-...`` comment header from a cached file,
+    leaving just the synthesized source (for showing to the model)."""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or lines[i].startswith("#")):
+        i += 1
+    return "\n".join(lines[i:]).strip()
 
 class Vibe:
     """An object whose undefined methods are synthesized by an LLM on first call."""
@@ -41,6 +57,7 @@ class Vibe:
         self._retries = retries
         self._console = Console(enabled=verbose)
         self._fns: dict[str, Callable[..., Any]] = {}
+        self._sources: dict[str, str] = {}
         self._specs: dict[str, Spec] = {}
         self._caching = caching
 
@@ -69,15 +86,27 @@ class Vibe:
         context: str | None = None,
         inputs: str | None = None,
         returns: str | None = None,
+        uses: list[str] | None = None,
     ) -> "Vibe":
-        """Register first-call guidance for ``name``: free-form context and the
-        intended input/output shapes the synthesizer should match.
+        """Register first-call guidance for ``name``: free-form context, the
+        intended input/output shapes the synthesizer should match, and ``uses``
+        — names of other vibe functions ``name`` depends on.
+
+        Each name in ``uses`` is shown to the synthesizer as exact source if it
+        has already been synthesized (else as its spec), so the new function
+        matches its formats — e.g. a decoder written against the encoder that
+        actually exists. They are also injected into the synthesized function's
+        namespace, so generated code can call them directly. If a dependency is
+        later evicted and regenerated, every function that ``uses`` it is
+        evicted too, since it was written against the old version.
 
         Consulted only when ``name`` is synthesized, so it has no effect once the
         function is cached and is never part of the cache key. Returns ``self``
         so specs can be chained before the first call.
         """
-        self._specs[name] = Spec(context=context, inputs=inputs, returns=returns)
+        self._specs[name] = Spec(
+            context=context, inputs=inputs, returns=returns, uses=tuple(uses or ())
+        )
         return self
 
     def __getattr__(self, name: str) -> Callable[..., Any]:
@@ -113,10 +142,23 @@ class Vibe:
         assert error is not None
         raise error
 
-    def _evict(self, name: str) -> None:
-        """Drop a synthesized function from both caches so it is regenerated."""
+    def _evict(self, name: str, _seen: set[str] | None = None) -> None:
+        """Drop a synthesized function from both caches so it is regenerated.
+
+        Cascades to dependents: any function whose spec ``uses`` this one was
+        synthesized against the version being evicted, so it goes too. A seen
+        set keeps mutual dependencies from recursing forever.
+        """
+        seen = _seen if _seen is not None else set()
+        if name in seen:
+            return
+        seen.add(name)
         self._fns.pop(name, None)
+        self._sources.pop(name, None)
         self._cache_path(name).unlink(missing_ok=True)
+        for dependent, spec in self._specs.items():
+            if name in spec.uses:
+                self._evict(dependent, seen)
 
     # -- resolution / caching ---------------------------------------------
 
@@ -139,26 +181,53 @@ class Vibe:
 
             path = self._cache_path(name)
             if path.exists():
-                fn = materialize(path.read_text(), name)
+                text = path.read_text()
+                fn = materialize(text, name, extras=self._dep_extras(name, text))
+                self._sources[name] = _strip_header(text)
                 self._fns[name] = fn
                 return fn
 
         source = strip_fences(self._generate(name, args, kwargs, error))
-        fn = materialize(source, name)
+        fn = materialize(source, name, extras=self._dep_extras(name))
+        self._sources[name] = source
         if self._caching:
             self._cache_path(name).write_text(self._cache_header(name) + source + "\n")
             self._fns[name] = fn
         return fn
 
+    def _dep_names(self, name: str, cached_text: str | None = None) -> tuple[str, ...]:
+        """Names of the vibe functions ``name`` may call: from its spec, or —
+        when loading from disk without a re-registered spec — from the
+        ``# vibe-uses:`` line in the cache header."""
+        spec = self._specs.get(name)
+        if spec is not None and spec.uses:
+            return spec.uses
+        if cached_text is not None:
+            match = _USES_RE.search(cached_text)
+            if match:
+                return tuple(d.strip() for d in match.group(1).split(",") if d.strip())
+        return ()
+
+    def _dep_extras(
+        self, name: str, cached_text: str | None = None
+    ) -> dict[str, Any]:
+        """Bind each declared dependency to its lazy vibe caller so synthesized
+        code can invoke siblings by name (resolving them on first use)."""
+        return {dep: getattr(self, dep) for dep in self._dep_names(name, cached_text)}
+
     def _cache_path(self, name: str) -> Path:
         return self._cache_dir / f"{name}.py"
 
     def _cache_header(self, name: str) -> str:
-        return (
-            f"# vibe-generated: {name}\n"
-            f"# model: {self._model}\n"
-            f"# WARNING: machine-written code, review before trusting.\n\n"
-        )
+        lines = [
+            f"# vibe-generated: {name}",
+            f"# model: {self._model}",
+        ]
+        deps = self._dep_names(name)
+        if deps:
+            lines.append(f"# vibe-uses: {', '.join(deps)}")
+        lines.append("# WARNING: machine-written code, review before trusting.")
+        return "\n".join(lines) + "\n\n"
 
     # -- generation --------------------------------------------------------
 
@@ -179,10 +248,21 @@ class Vibe:
             name, args, kwargs, error,
             packages=self._packages,
             spec=self._specs.get(name),
+            dependencies=[self._dependency(d) for d in self._dep_names(name)],
         )
         source = self._stream(messages)
         self._console.status(f"synthesized {name}")
         return source
+
+    def _dependency(self, dep: str) -> Dependency:
+        """What we can show the model about ``dep``: its exact synthesized
+        source (memory, then disk), else just its registered spec."""
+        source = self._sources.get(dep)
+        if source is None and self._caching:
+            path = self._cache_path(dep)
+            if path.exists():
+                source = _strip_header(path.read_text())
+        return Dependency(name=dep, source=source, spec=self._specs.get(dep))
 
     def _completion_kwargs(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         """litellm kwargs; api_base/api_key/extra_body sent only when set."""

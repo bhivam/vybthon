@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 _FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)?\s*\n(.*?)```", re.DOTALL)
 
@@ -90,7 +90,8 @@ def _import_hint(packages: list[str] | None) -> str:
 
 @dataclass(frozen=True)
 class Spec:
-    """First-call guidance for a function: free-form context and I/O shapes.
+    """First-call guidance for a function: free-form context, I/O shapes, and
+    the names of sibling vibe functions it must interoperate with (``uses``).
 
     Held in a registry keyed by function name and consulted only at synthesis
     time, so it never affects the cache and is ignored once a function is cached.
@@ -99,8 +100,11 @@ class Spec:
     context: str | None = None
     inputs: str | None = None
     returns: str | None = None
+    uses: tuple[str, ...] = ()
 
-    def render(self) -> str:
+    def describe(self) -> str:
+        """Just the guidance lines, no framing — also used to describe this
+        function when it appears as a not-yet-synthesized dependency."""
         parts = []
         if self.context:
             parts.append(self.context)
@@ -108,13 +112,61 @@ class Spec:
             parts.append(f"Inputs: {self.inputs}")
         if self.returns:
             parts.append(f"Output: {self.returns}")
-        if not parts:
+        return "\n".join(parts)
+
+    def render(self) -> str:
+        body = self.describe()
+        if not body:
             return ""
-        body = "\n".join(parts)
         return (
             "\n\nAuthoritative guidance for this function — follow it and match "
             f"the stated shapes:\n{body}"
         )
+
+
+DEPENDENCIES_PROMPT = """
+
+`{name}` must interoperate with the following functions, which live on the same \
+object. At runtime they are in scope and can be called directly by name — do \
+NOT re-define, re-implement, or import them, and do not include their source in \
+your output. Treat their behavior and data formats as FIXED: whatever they \
+produce or consume, `{name}` must match exactly.
+
+{blocks}\
+"""
+
+
+@dataclass(frozen=True)
+class Dependency:
+    """A sibling vibe function the synthesized function must interoperate with:
+    its exact synthesized source when available, else its registered spec."""
+
+    name: str
+    source: str | None = None
+    spec: Spec | None = None
+
+    def render(self) -> str:
+        if self.source:
+            return (
+                f"### `{self.name}` — exact current implementation:\n"
+                f"```python\n{self.source}\n```"
+            )
+        described = self.spec.describe() if self.spec else ""
+        if described:
+            return (
+                f"### `{self.name}` — not synthesized yet; its agreed contract:\n"
+                f"{described}"
+            )
+        return (
+            f"### `{self.name}` — not synthesized yet; nothing is known about it "
+            f"beyond its name. Infer its contract from the name and stay "
+            f"consistent with the most natural interpretation."
+        )
+
+
+def render_dependencies(name: str, dependencies: list[Dependency]) -> str:
+    blocks = "\n\n".join(dep.render() for dep in dependencies)
+    return DEPENDENCIES_PROMPT.format(name=name, blocks=blocks)
 
 
 class VibeError(RuntimeError):
@@ -196,11 +248,14 @@ def build_messages(
     *,
     packages: list[str] | None = None,
     spec: Spec | None = None,
+    dependencies: list[Dependency] | None = None,
 ) -> list[dict[str, str]]:
     """Build the chat messages that ask the model to synthesize ``name``.
 
     ``packages`` are third-party deps the model is allowed to import. ``spec`` is
-    optional first-call guidance (context and I/O shapes). If ``error`` is given
+    optional first-call guidance (context and I/O shapes). ``dependencies`` are
+    sibling vibe functions ``name`` must interoperate with — their source (or
+    spec) is shown so the model matches their formats. If ``error`` is given
     (a previous attempt that raised), its type and message are appended so the
     model can correct course on the retry.
     """
@@ -211,6 +266,8 @@ def build_messages(
     )
     if spec is not None:
         user += spec.render()
+    if dependencies:
+        user += render_dependencies(name, dependencies)
     if error is not None:
         hint = _import_hint(packages) if isinstance(error, ImportError) else ""
         user += RETRY_PROMPT.format(
@@ -223,9 +280,15 @@ def build_messages(
     ]
 
 
-def materialize(source: str, name: str) -> Callable[..., Any]:
-    """exec ``source`` in a fresh namespace and pull out the function ``name``."""
-    namespace: dict[str, Any] = {}
+def materialize(
+    source: str, name: str, extras: Mapping[str, Any] | None = None
+) -> Callable[..., Any]:
+    """exec ``source`` in a fresh namespace and pull out the function ``name``.
+
+    ``extras`` are pre-bound names (declared dependencies) made visible to the
+    synthesized code so it can call its sibling functions directly.
+    """
+    namespace: dict[str, Any] = dict(extras) if extras else {}
     try:
         exec(compile(source, f"<vibe:{name}>", "exec"), namespace)
     except SyntaxError as exc:
